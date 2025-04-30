@@ -1,0 +1,1172 @@
+-- SpellEffectHandler (ServerScriptService)
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local BuffUiTemplate    = ReplicatedStorage:WaitForChild("BuffUi")
+local buffUIEvent      = ReplicatedStorage:WaitForChild("BuffUIEvent")
+local Players           = game:GetService("Players")
+local castSpellEvent    = ReplicatedStorage:WaitForChild("CastSpellEvent")
+
+-- UI helper: manage per-player BillboardGui
+local BuffUis = {}  -- [player] = cloned BuffUi
+local function getBuffGui(player)
+	if BuffUis[player] and BuffUis[player].Parent then
+		return BuffUis[player]
+	end
+	local char = player.Character or player.CharacterAdded:Wait()
+	local head = char:WaitForChild("Head")
+	local gui = BuffUiTemplate:Clone()
+	gui.Parent = head
+	gui.Enabled = true
+	-- hide all buff frames by default
+	for _, f in ipairs(gui:GetChildren()) do
+		if f:IsA("Frame") then f.Visible = false end
+	end
+	BuffUis[player] = gui
+	return gui
+end
+
+local function hideBuffFrame(player, abilityName)
+	local gui = BuffUis[player]
+	if not gui then return end
+	local f = gui:FindFirstChild(abilityName)
+	if f then f.Visible = false end
+end
+
+-- State tables
+local IceBarrierBuffUis   = {}    -- [player] = cloned BillboardGui
+local IceBarrierShields   = {}    -- [player] = remaining absorb
+local IceBarrierConns     = {}    -- [player] = HealthChanged conn
+local IceBarrierEffects   = {}    -- [player] = {centralAttachment, cleanup, createDamageFeedback}
+local IceBarrierTimers = {}   -- [player] = thread
+local OriginalWalkSpeeds  = {}    -- [player] = number
+local AlterTimePositions  = {}    -- [player] = Vector3
+local AlterTimeHealths = {}  -- [player] = health at cast time
+local IceBarrierCountdowns = {}  -- [player] = thread de cuenta atrás
+local IceBarrierCleanups = {}    -- [player] = thread de limpieza
+
+
+-- Cleanup helper for Ice Barrier
+
+local function cleanupBarrier(player)
+	-- disconnect the health listener
+	if IceBarrierConns[player] then
+		IceBarrierConns[player]:Disconnect()
+		IceBarrierConns[player] = nil
+	end
+
+	-- clear the absorb value
+	IceBarrierShields[player] = nil
+
+	-- hide the buff icon
+	hideBuffFrame(player, "IceBarrier")
+
+	-- destroy any dedicated VFX/UI you stored (if you’re using IceBarrierBuffUis, etc.)
+	if IceBarrierBuffUis[player] then
+		IceBarrierBuffUis[player]:Destroy()
+		IceBarrierBuffUis[player] = nil
+	end
+
+	if IceBarrierEffects[player] then
+		IceBarrierEffects[player].cleanup()
+		IceBarrierEffects[player] = nil
+	end
+end
+
+-- Cleanup on respawn/removal
+local function cleanupPlayer(player)
+	-- Destroy any existing BuffUi so we’ll re-clone it next time
+	if BuffUis[player] then
+		BuffUis[player]:Destroy()
+		BuffUis[player] = nil
+	end
+
+	cleanupBarrier(player)
+	OriginalWalkSpeeds[player]   = nil
+	AlterTimePositions[player]   = nil
+	AlterTimeHealths[player]     = nil
+end
+
+Players.PlayerRemoving:Connect(cleanupPlayer)
+Players.PlayerAdded:Connect(function(player)
+	player.CharacterAdded:Connect(function()
+		cleanupPlayer(player)
+	end)
+end)
+
+Players.PlayerRemoving:Connect(cleanupPlayer)
+Players.PlayerAdded:Connect(function(player)
+	player.CharacterAdded:Connect(function()
+		cleanupPlayer(player)
+	end)
+end)
+
+-- Helper: attach basic particle effect and return the Attachment
+local function attachParticleVFX(char, properties, duration, targetPart)
+	local part = targetPart or char.PrimaryPart
+	if not part then return nil end
+
+	local attachment = Instance.new("Attachment")
+	attachment.Parent = part
+	local emitter = Instance.new("ParticleEmitter")
+	for prop, val in pairs(properties) do
+		emitter[prop] = val
+	end
+	emitter.Parent = attachment
+
+	delay(duration, function()
+		emitter.Enabled = false
+		wait(1)
+		if attachment and attachment.Parent then
+			attachment:Destroy()
+		end
+	end)
+
+	return attachment
+end
+
+-- Create Ice Barrier effect with advanced visual style
+local function createDampenHarmAura(char)
+	local torso = char:FindFirstChild("UpperTorso") or char:FindFirstChild("Torso")
+	if not torso then return nil end
+
+	local centralAttachment = Instance.new("Attachment")
+	centralAttachment.Parent = torso
+
+	-- Main shield components
+	local shields = {}
+	local shieldModels = {}
+	local glowEffects = {}
+
+	-- Create layered ice crystal shield effect
+	for i = 1, 5 do  -- Increased from 3 to 5 shields for more visual complexity
+		local shieldAttach = Instance.new("Attachment")
+		shieldAttach.Parent = torso
+
+		-- Positioning with varied distances and angles
+		local angle = (i-1) * (2*math.pi/5)
+		local radius = 2 + 0.25 * math.sin(i * 1.2)  -- Varied radius for more dynamic positioning
+		local height = 0.3 * math.cos(i * 0.8)  -- Variable height offset
+		shieldAttach.Position = Vector3.new(math.cos(angle) * radius, height, math.sin(angle) * radius)
+
+		-- Create the shield part with more interesting geometry
+		local shield = Instance.new("Part")
+		shield.Size = Vector3.new(2.2 + i*0.2, 2.8 + i*0.15, 0.15)  -- Varied sizes
+		shield.Transparency = 0.4 + (i % 2) * 0.2  -- Alternating transparency
+		shield.CanCollide = false
+		shield.Anchored = true
+		shield.Material = i % 2 == 0 and Enum.Material.ForceField or Enum.Material.Glass
+		shield.Color = Color3.fromRGB(180 + i*10, 220 + i*7, 255)  -- Varied blue tones
+		shield.Parent = workspace
+
+		-- Create crystalline appearance with wedges
+		if i % 2 == 0 then
+			local crystalTop = Instance.new("WedgePart")
+			crystalTop.Size = Vector3.new(1, 0.8, 0.8)
+			crystalTop.Transparency = 0.5
+			crystalTop.CanCollide = false
+			crystalTop.Anchored = true
+			crystalTop.Material = Enum.Material.SmoothPlastic
+			crystalTop.Color = Color3.fromRGB(180, 240, 255)
+			crystalTop.Parent = workspace
+			table.insert(shieldModels, crystalTop)
+
+			local crystalBottom = crystalTop:Clone()
+			crystalBottom.Parent = workspace
+			table.insert(shieldModels, crystalBottom)
+		end
+
+		-- Create enhanced shield details with multiple layers
+		local surfaceGui = Instance.new("SurfaceGui")
+		surfaceGui.Face = Enum.NormalId.Front
+		surfaceGui.LightInfluence = 0
+		surfaceGui.Parent = shield
+
+		local frame = Instance.new("Frame")
+		frame.Size = UDim2.new(1, 0, 1, 0)
+		frame.BackgroundTransparency = 1
+		frame.Parent = surfaceGui
+
+		-- Primary rune/sigil
+		local image = Instance.new("ImageLabel")
+		image.Size = UDim2.new(0.9, 0, 0.9, 0)
+		image.Position = UDim2.new(0.05, 0, 0.05, 0)
+		image.BackgroundTransparency = 1
+		image.Image = "rbxassetid://88665106354694"  -- Magical rune texture
+		image.ImageTransparency = 0.3
+		image.Parent = frame
+
+		-- Secondary geometric pattern overlay
+		local pattern = Instance.new("ImageLabel")
+		pattern.Size = UDim2.new(1, 0, 1, 0)
+		pattern.BackgroundTransparency = 1
+		pattern.Image = "rbxassetid://126459164393672"  -- Geometric pattern
+		pattern.ImageTransparency = 0.7
+		pattern.ImageColor3 = Color3.fromRGB(220, 240, 255)
+		pattern.Parent = frame
+
+		-- Add subtle animation to the pattern
+		local patternTween = game:GetService("TweenService"):Create(
+			pattern,
+			TweenInfo.new(4, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut, -1, true),
+			{Rotation = 15, ImageTransparency = 0.6}
+		)
+		patternTween:Play()
+
+		-- Create pulsing border effect
+		local border = Instance.new("UIStroke")
+		border.Color = Color3.fromRGB(150, 210, 255)
+		border.Thickness = 2
+		border.Parent = frame
+
+		-- Add border animation
+		local borderTween = game:GetService("TweenService"):Create(
+			border, 
+			TweenInfo.new(1.5, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut, -1, true),
+			{Thickness = 4, Transparency = 0.5}
+		)
+		borderTween:Play()
+
+		-- Clone GUI to back face with mirrored effect
+		local backUi = surfaceGui:Clone()
+		backUi.Parent = shield
+		backUi.Face = Enum.NormalId.Back
+
+		-- Add edge glow effect using beams
+		for j = 1, 4 do
+			local edgeAttach1 = Instance.new("Attachment")
+			local edgeAttach2 = Instance.new("Attachment")
+
+			-- Position attachments at corners
+			local xPos = (j <= 2) and -1 or 1
+			local yPos = (j % 2 == 1) and -1 or 1
+			edgeAttach1.Position = Vector3.new(xPos, yPos, 0) * shield.Size/2
+			edgeAttach2.Position = Vector3.new(xPos, -yPos, 0) * shield.Size/2
+
+			edgeAttach1.Parent = shield
+			edgeAttach2.Parent = shield
+
+			local beam = Instance.new("Beam")
+			beam.Attachment0 = edgeAttach1
+			beam.Attachment1 = edgeAttach2
+			beam.Width0 = 0.1
+			beam.Width1 = 0.1
+			beam.FaceCamera = true
+			beam.LightEmission = 1
+			beam.LightInfluence = 0
+			beam.Texture = "rbxassetid://18722421816"  -- Beam texture
+			beam.TextureSpeed = 0.5
+			beam.TextureLength = 0.5
+			beam.Color = ColorSequence.new(Color3.fromRGB(150, 220, 255))
+			beam.Transparency = NumberSequence.new({
+				NumberSequenceKeypoint.new(0, 0.3),
+				NumberSequenceKeypoint.new(0.5, 0.6),
+				NumberSequenceKeypoint.new(1, 0.3)
+			})
+			beam.Parent = shield
+
+			-- Store to destroy later
+			table.insert(glowEffects, {edgeAttach1, edgeAttach2, beam})
+		end
+
+		-- Point light for localized glow
+		local pointLight = Instance.new("PointLight")
+		pointLight.Color = Color3.fromRGB(180, 230, 255)
+		pointLight.Range = 4
+		pointLight.Brightness = 0.8
+		pointLight.Parent = shield
+
+		table.insert(shields, shieldAttach)
+		table.insert(shieldModels, shield)
+	end
+
+	-- Enhanced character aura effect with multiple emitters
+	-- Main aura glow
+	local auraEmitter = Instance.new("ParticleEmitter")
+	auraEmitter.Texture = "rbxassetid://6294826355"  -- Glow texture
+	auraEmitter.Lifetime = NumberRange.new(0.8, 1.2)
+	auraEmitter.Speed = NumberRange.new(0.1, 0.3)
+	auraEmitter.Rate = 20
+	auraEmitter.Size = NumberSequence.new({
+		NumberSequenceKeypoint.new(0, 4),
+		NumberSequenceKeypoint.new(0.5, 4.5),
+		NumberSequenceKeypoint.new(1, 4)
+	})
+	auraEmitter.Transparency = NumberSequence.new({
+		NumberSequenceKeypoint.new(0, 0.7),
+		NumberSequenceKeypoint.new(0.5, 0.8),
+		NumberSequenceKeypoint.new(1, 1)
+	})
+	auraEmitter.Color = ColorSequence.new({
+		ColorSequenceKeypoint.new(0, Color3.fromRGB(150, 200, 255)),
+		ColorSequenceKeypoint.new(1, Color3.fromRGB(200, 230, 255))
+	})
+	auraEmitter.LightEmission = 0.7
+	auraEmitter.Parent = centralAttachment
+
+	-- Frost particles effect
+	local frostEmitter = Instance.new("ParticleEmitter")
+	frostEmitter.Texture = "rbxassetid://12003098335"  -- Snowflake/frost texture
+	frostEmitter.Lifetime = NumberRange.new(1.2, 1.8)
+	frostEmitter.Speed = NumberRange.new(0.5, 1)
+	frostEmitter.Rate = 8
+	frostEmitter.Size = NumberSequence.new({
+		NumberSequenceKeypoint.new(0, 0.1),
+		NumberSequenceKeypoint.new(0.2, 0.3),
+		NumberSequenceKeypoint.new(1, 0.1)
+	})
+	frostEmitter.Transparency = NumberSequence.new({
+		NumberSequenceKeypoint.new(0, 0.2),
+		NumberSequenceKeypoint.new(0.8, 0.6),
+		NumberSequenceKeypoint.new(1, 1)
+	})
+	frostEmitter.Color = ColorSequence.new(Color3.fromRGB(220, 240, 255))
+	frostEmitter.RotSpeed = NumberRange.new(-90, 90)
+	frostEmitter.Parent = centralAttachment
+
+	-- Add trailing effects with improved visuals
+	local trailParts = {}
+	for i = 1, 5 do
+		local trailPart = Instance.new("Part")
+		trailPart.Size = Vector3.new(0.2, 0.2, 0.2)
+		trailPart.Transparency = 1
+		trailPart.CanCollide = false
+		trailPart.Anchored = true
+		trailPart.Parent = workspace
+
+		-- Create a more dynamic trail
+		local trail = Instance.new("Trail")
+		trail.Color = ColorSequence.new({
+			ColorSequenceKeypoint.new(0, Color3.fromRGB(180, 210, 255)),
+			ColorSequenceKeypoint.new(0.5, Color3.fromRGB(150, 190, 255)),
+			ColorSequenceKeypoint.new(1, Color3.fromRGB(120, 170, 255))
+		})
+		trail.Transparency = NumberSequence.new({
+			NumberSequenceKeypoint.new(0, 0.5),
+			NumberSequenceKeypoint.new(0.5, 0.7),
+			NumberSequenceKeypoint.new(1, 1)
+		})
+		trail.Lifetime = 0.4
+		trail.MinLength = 0.1
+		trail.MaxLength = 0.8
+		trail.WidthScale = NumberSequence.new({
+			NumberSequenceKeypoint.new(0, 1),
+			NumberSequenceKeypoint.new(0.5, 0.5),
+			NumberSequenceKeypoint.new(1, 0)
+		})
+		trail.LightEmission = 0.7
+		trail.FaceCamera = true
+		trail.Texture = "rbxassetid://4809471713"  -- Energy/magic trail texture
+		trail.TextureLength = 0.5
+
+		local a1 = Instance.new("Attachment")
+		local a2 = Instance.new("Attachment")
+		a1.Position = Vector3.new(-0.1, 0, 0)
+		a2.Position = Vector3.new(0.1, 0, 0)
+		a1.Parent = trailPart
+		a2.Parent = trailPart
+
+		trail.Attachment0 = a1
+		trail.Attachment1 = a2
+		trail.Parent = trailPart
+
+		table.insert(trailParts, trailPart)
+	end
+
+	-- Enhanced pulse effect (every 2 seconds)
+	spawn(function()
+		while centralAttachment and centralAttachment.Parent do
+			-- Main pulse ring
+			local pulseEmitter = Instance.new("ParticleEmitter")
+			pulseEmitter.Texture = "rbxassetid://121925788322966"  -- Ring texture
+			pulseEmitter.Lifetime = NumberRange.new(0.7, 0.9)
+			pulseEmitter.Speed = NumberRange.new(4, 6)
+			pulseEmitter.Acceleration = Vector3.new(0, 0, 0)
+			pulseEmitter.Size = NumberSequence.new({
+				NumberSequenceKeypoint.new(0, 1),
+				NumberSequenceKeypoint.new(1, 8)
+			})
+			pulseEmitter.Transparency = NumberSequence.new({
+				NumberSequenceKeypoint.new(0, 0.1),
+				NumberSequenceKeypoint.new(0.7, 0.6),
+				NumberSequenceKeypoint.new(1, 1)
+			})
+			pulseEmitter.Color = ColorSequence.new({
+				ColorSequenceKeypoint.new(0, Color3.fromRGB(200, 230, 255)),
+				ColorSequenceKeypoint.new(1, Color3.fromRGB(150, 200, 255))
+			})
+			pulseEmitter.LightEmission = 0.8
+			pulseEmitter.EmissionDirection = Enum.NormalId.Front
+			pulseEmitter.Parent = centralAttachment
+			pulseEmitter:Emit(1)
+
+			-- Secondary flare effect with the pulse
+			local flareEmitter = Instance.new("ParticleEmitter")
+			flareEmitter.Texture = "rbxassetid://10906540366"  -- Flare texture
+			flareEmitter.Lifetime = NumberRange.new(0.3, 0.5)
+			flareEmitter.Speed = NumberRange.new(0.5, 1)
+			flareEmitter.Size = NumberSequence.new({
+				NumberSequenceKeypoint.new(0, 3),
+				NumberSequenceKeypoint.new(1, 0.5)
+			})
+			flareEmitter.Transparency = NumberSequence.new({
+				NumberSequenceKeypoint.new(0, 0.3),
+				NumberSequenceKeypoint.new(1, 1)
+			})
+			flareEmitter.Color = ColorSequence.new(Color3.fromRGB(220, 240, 255))
+			flareEmitter.LightEmission = 0.9
+			flareEmitter.Parent = centralAttachment
+			flareEmitter:Emit(5)
+
+			-- Shockwave effect
+			local shockwaveEmitter = Instance.new("ParticleEmitter")
+			shockwaveEmitter.Texture = "rbxassetid://8509953946"  -- Wave texture
+			shockwaveEmitter.Lifetime = NumberRange.new(0.4, 0.5)
+			shockwaveEmitter.Speed = NumberRange.new(0.1, 0.3)
+			shockwaveEmitter.Size = NumberSequence.new({
+				NumberSequenceKeypoint.new(0, 2),
+				NumberSequenceKeypoint.new(1, 10)
+			})
+			shockwaveEmitter.Transparency = NumberSequence.new({
+				NumberSequenceKeypoint.new(0, 0.4),
+				NumberSequenceKeypoint.new(0.5, 0.7),
+				NumberSequenceKeypoint.new(1, 1)
+			})
+			shockwaveEmitter.Color = ColorSequence.new(Color3.fromRGB(180, 220, 255))
+			shockwaveEmitter.LightEmission = 0.7
+			shockwaveEmitter.Parent = centralAttachment
+			shockwaveEmitter:Emit(1)
+
+			wait(0.15)
+			if pulseEmitter and pulseEmitter.Parent then pulseEmitter:Destroy() end
+			if flareEmitter and flareEmitter.Parent then flareEmitter:Destroy() end
+			if shockwaveEmitter and shockwaveEmitter.Parent then shockwaveEmitter:Destroy() end
+
+			wait(1.85)  -- Complete cycle is now 2 seconds for more frequent effects
+		end
+	end)
+
+	-- Add ambient sound effect for immersion
+	local soundEffect = Instance.new("Sound")
+	soundEffect.SoundId = "rbxassetid://6882494617"  -- Magical barrier sound
+	soundEffect.Volume = 0.7
+	soundEffect.Looped = true
+	soundEffect.Parent = torso
+	soundEffect:Play()
+
+	-- Advanced rotation animation with varied speeds and bouncing motion
+	local baseAngle = 0
+	local rotationSpeed = math.pi/4  -- Base rotation speed
+	local timeOffset = 0
+
+	spawn(function()
+		while centralAttachment and centralAttachment.Parent do
+			local deltaTime = wait()
+			timeOffset = timeOffset + deltaTime
+			baseAngle = baseAngle + rotationSpeed * deltaTime
+
+			for i, shieldAttach in ipairs(shields) do
+				if shieldAttach and shieldAttach.Parent then
+					-- Calculate dynamic position with oscillation
+					local individualSpeed = rotationSpeed * (1 + 0.1 * math.sin(i + timeOffset))
+					local angle = baseAngle + (i-1) * (2*math.pi/5)
+
+					-- Add vertical bobbing motion
+					local verticalOffset = 0.3 * math.sin(timeOffset * 2 + i)
+					local radiusVariation = 2 + 0.2 * math.sin(timeOffset * 3 + i * 0.7)
+
+					-- Set position with combined effects
+					shieldAttach.Position = Vector3.new(
+						math.cos(angle) * radiusVariation, 
+						verticalOffset, 
+						math.sin(angle) * radiusVariation
+					)
+
+					-- Update shield position and orientation with tilt
+					if shieldModels[i] and shieldModels[i].Parent then
+						local shieldPos = torso.CFrame:PointToWorldSpace(shieldAttach.Position)
+						local lookAt = torso.Position
+
+						-- Add tilting effect based on movement
+						local tiltAmount = 0.2 * math.sin(timeOffset * 4 + i)
+						local tiltX = math.sin(angle) * tiltAmount
+						local tiltZ = math.cos(angle) * tiltAmount
+
+						shieldModels[i].CFrame = CFrame.new(shieldPos, lookAt) 
+							* CFrame.Angles(tiltX, math.pi/2, tiltZ)
+					end
+
+					-- Update crystal positions if they exist (for even indexed shields)
+					local crystalIndex1 = i * 2
+					local crystalIndex2 = i * 2 + 1
+
+					if i % 2 == 0 and shieldModels[crystalIndex1] and shieldModels[crystalIndex2] then
+						local shieldPos = torso.CFrame:PointToWorldSpace(shieldAttach.Position)
+						local baseCFrame = CFrame.new(shieldPos, torso.Position)
+
+						-- Position the crystal wedges on top and bottom of shield
+						shieldModels[crystalIndex1].CFrame = baseCFrame * CFrame.new(0, 1.5, 0) * CFrame.Angles(math.rad(180), 0, 0)
+						shieldModels[crystalIndex2].CFrame = baseCFrame * CFrame.new(0, -1.5, 0)
+					end
+
+					-- Update trail part position with offset for more interesting effect
+					local trailIndex = i
+					if trailParts[trailIndex] and trailParts[trailIndex].Parent then
+						local basePos = torso.CFrame:PointToWorldSpace(shieldAttach.Position)
+						local trailOffset = Vector3.new(
+							math.sin(timeOffset * 5 + i) * 0.5,
+							math.cos(timeOffset * 4 + i) * 0.5,
+							math.sin(timeOffset * 6 + i) * 0.5
+						)
+						trailParts[trailIndex].CFrame = CFrame.new(basePos + trailOffset)
+					end
+				end
+			end
+		end
+	end)
+
+	-- Damage feedback effect function
+	local function createDamageFeedback()
+		-- Flash effect
+		local flash = Instance.new("PointLight")
+		flash.Color = Color3.fromRGB(150, 210, 255)
+		flash.Range = 10
+		flash.Brightness = 2
+		flash.Parent = torso
+
+		-- Impact particles
+		local impactEmitter = Instance.new("ParticleEmitter")
+		impactEmitter.Texture = "rbxassetid://2581223252"  -- Ice/crystal shard texture
+		impactEmitter.Speed = NumberRange.new(5, 10)
+		impactEmitter.Lifetime = NumberRange.new(0.6, 1)
+		impactEmitter.Size = NumberSequence.new({
+			NumberSequenceKeypoint.new(0, 0.5),
+			NumberSequenceKeypoint.new(0.5, 0.3),
+			NumberSequenceKeypoint.new(1, 0.1)
+		})
+		impactEmitter.Transparency = NumberSequence.new({
+			NumberSequenceKeypoint.new(0, 0),
+			NumberSequenceKeypoint.new(0.8, 0.5),
+			NumberSequenceKeypoint.new(1, 1)
+		})
+		impactEmitter.Color = ColorSequence.new(Color3.fromRGB(200, 230, 255))
+		impactEmitter.SpreadAngle = Vector2.new(-180, 180)
+		impactEmitter.Acceleration = Vector3.new(0, -10, 0)
+		impactEmitter.LightEmission = 0.6
+		impactEmitter.LightInfluence = 0.2
+		impactEmitter.Parent = centralAttachment
+		impactEmitter:Emit(25)
+
+		-- Sound effect
+		local impactSound = Instance.new("Sound")
+		impactSound.SoundId = "rbxassetid://107467482558699"  -- Ice impact sound
+		impactSound.Volume = 0.8
+		impactSound.PlaybackSpeed = 1.2
+		impactSound.Parent = torso
+		impactSound:Play()
+
+		-- Cleanup
+		delay(1, function()
+			if flash and flash.Parent then flash:Destroy() end
+			if impactEmitter and impactEmitter.Parent then impactEmitter:Destroy() end
+			if impactSound and impactSound.Parent then 
+				impactSound.Ended:Connect(function()
+					impactSound:Destroy()
+				end)
+			end
+		end)
+	end
+
+	-- Expose damage feedback function for use in health changed event
+	centralAttachment:SetAttribute("createDamageFeedback", true)  -- Mark for reference
+
+	-- Comprehensive cleanup function
+	local cleanupFunc = function()
+		if centralAttachment and centralAttachment.Parent then
+			centralAttachment:Destroy()
+		end
+
+		for _, shield in ipairs(shields) do
+			if shield and shield.Parent then
+				shield:Destroy()
+			end
+		end
+
+		for _, model in ipairs(shieldModels) do
+			if model and model.Parent then
+				model:Destroy()
+			end
+		end
+
+		for _, trail in ipairs(trailParts) do
+			if trail and trail.Parent then
+				trail:Destroy()
+			end
+		end
+
+		for _, effectGroup in ipairs(glowEffects) do
+			for _, effect in ipairs(effectGroup) do
+				if effect and effect.Parent then
+					effect:Destroy()
+				end
+			end
+		end
+
+		if soundEffect and soundEffect.Parent then
+			soundEffect:Stop()
+			soundEffect:Destroy()
+		end
+
+		-- Stop all tweens
+		for _, descendant in pairs(workspace:GetDescendants()) do
+			if descendant:IsA("BasePart") and descendant:GetAttribute("DampenHarmEffect") then
+				descendant:Destroy()
+			end
+		end
+	end
+
+	delay(60, cleanupFunc)
+
+	return {
+		centralAttachment = centralAttachment,
+		cleanup = cleanupFunc,
+		createDamageFeedback = createDamageFeedback
+	}
+end
+
+-- Bind Ice Barrier logic
+local function bindIceBarrier(player, humanoid, amount)
+	-- cleanup any existing barrier first
+	cleanupBarrier(player)
+	-- store new shield amount
+	IceBarrierShields[player] = amount
+
+	-- show buff icon
+	local char   = player.Character or player.CharacterAdded:Wait()
+	local gui    = getBuffGui(player)
+	local frame  = gui:FindFirstChild("IceBarrier")
+	frame.Visible = true
+
+	-- countdown setup
+	local duration  = 60
+	local imageLabel = frame:FindFirstChildWhichIsA("ImageLabel")
+	local countdownLbl = imageLabel and imageLabel:FindFirstChild("Countdown")
+	local overlay      = imageLabel and imageLabel:FindFirstChild("CooldownOverlay")
+
+	if countdownLbl then
+		-- Cancela sólo el contador anterior
+		if IceBarrierCountdowns[player] then
+			task.cancel(IceBarrierCountdowns[player])
+		end
+
+		IceBarrierCountdowns[player] = task.spawn(function()
+			for rem = duration, 1, -1 do
+				if not countdownLbl.Parent then break end
+				countdownLbl.Text = tostring(rem)
+				if overlay then
+					overlay.Size = UDim2.new(1, 0, rem / duration, 0)
+				end
+				task.wait(1)
+			end
+			-- Al acabar la cuenta atrás, oculta y limpia todo
+			frame.Visible = false
+			cleanupBarrier(player)
+			IceBarrierCountdowns[player] = nil
+		end)
+	end
+
+	-- original VFX + health hook
+	local prevHealth = humanoid.Health
+	local effectData = createDampenHarmAura(char)
+	IceBarrierEffects[player] = effectData
+
+	local conn = humanoid.HealthChanged:Connect(function(newHealth)
+		local shield = IceBarrierShields[player]
+		if shield and newHealth < prevHealth then
+			local dmg = prevHealth - newHealth
+			if shield > dmg then
+				IceBarrierShields[player] = shield - dmg
+				humanoid.Health = newHealth + dmg
+			else
+				humanoid.Health = newHealth + shield
+				cleanupBarrier(player)
+			end
+			effectData.createDamageFeedback()
+		end
+		prevHealth = humanoid.Health
+	end)
+	IceBarrierConns[player] = conn
+
+	-- schedule cleanup after duration
+	IceBarrierTimers[player] = task.delay(duration, function()
+		cleanupBarrier(player)
+	end)
+end
+
+-- Bind AlterTime buff UI
+local function bindAlterTime(player, duration)
+	local gui   = getBuffGui(player)
+	local frame = gui:FindFirstChild("AlterTime")
+	frame.Visible = true
+
+	local imageLabel   = frame:FindFirstChildWhichIsA("ImageLabel")
+	local countdownLbl = imageLabel and imageLabel:FindFirstChild("Countdown")
+	local overlay      = imageLabel and imageLabel:FindFirstChild("CooldownOverlay")
+	local startTime    = tick()
+
+	if countdownLbl then
+		countdownLbl.Text = tostring(duration)
+		spawn(function()
+			while countdownLbl.Parent and tick() < startTime + duration do
+				local rem = math.ceil(startTime + duration - tick())
+				countdownLbl.Text = tostring(rem)
+				if overlay then
+					overlay.Size = UDim2.new(1, 0, rem / duration, 0)
+				end
+				wait(0.1)
+			end
+			frame.Visible = false
+		end)
+	end
+end
+
+-- Bind BlazingSpeed buff UI
+local function bindBlazingSpeed(player, duration)
+	local gui   = getBuffGui(player)
+	local frame = gui:FindFirstChild("BlazingSpeed")
+	frame.Visible = true
+
+	local imageLabel   = frame:FindFirstChildWhichIsA("ImageLabel")
+	local countdownLbl = imageLabel and imageLabel:FindFirstChild("Countdown")
+	local overlay      = imageLabel and imageLabel:FindFirstChild("CooldownOverlay")
+	local startTime    = tick()
+
+	if countdownLbl then
+		countdownLbl.Text = tostring(duration)
+		spawn(function()
+			while countdownLbl.Parent and tick() < startTime + duration do
+				local rem = math.ceil(startTime + duration - tick())
+				countdownLbl.Text = tostring(rem)
+				if overlay then
+					overlay.Size = UDim2.new(1, 0, rem / duration, 0)
+				end
+				wait(0.1)
+			end
+			frame.Visible = false
+		end)
+	end
+end
+
+-- Updated Time Vortex function with WoW MoP-style effects
+local function createTimeVortex(char)
+	local root = char.PrimaryPart
+	if not root then return end
+	local torso = char:FindFirstChild("UpperTorso") or char:FindFirstChild("Torso")
+	if not torso then return end
+
+	local centralAttach = Instance.new("Attachment")
+	centralAttach.Parent = torso
+
+	local effects = {}
+	-- Main arcane swirl
+	local mainVortex = Instance.new("ParticleEmitter")
+	mainVortex.Texture = "rbxassetid://16874341447"
+	mainVortex.Lifetime = NumberRange.new(1.5, 2)
+	mainVortex.Rate = 30
+	mainVortex.Speed = NumberRange.new(0.2, 0.5)
+	mainVortex.SpreadAngle = Vector2.new(-5, 5)
+	mainVortex.Rotation = NumberRange.new(0, 360)
+	mainVortex.RotSpeed = NumberRange.new(-30, 30)
+	mainVortex.Size = NumberSequence.new({
+		NumberSequenceKeypoint.new(0, 3),
+		NumberSequenceKeypoint.new(0.5, 4),
+		NumberSequenceKeypoint.new(1, 3)
+	})
+	mainVortex.Transparency = NumberSequence.new({
+		NumberSequenceKeypoint.new(0, 0.2),
+		NumberSequenceKeypoint.new(0.8, 0.4),
+		NumberSequenceKeypoint.new(1, 1)
+	})
+	mainVortex.Color = ColorSequence.new({
+		ColorSequenceKeypoint.new(0, Color3.fromRGB(180, 120, 255)),
+		ColorSequenceKeypoint.new(0.5, Color3.fromRGB(120, 100, 255)),
+		ColorSequenceKeypoint.new(1, Color3.fromRGB(70, 70, 255))
+	})
+	mainVortex.LightEmission = 0.8
+	mainVortex.Parent = centralAttach
+	table.insert(effects, mainVortex)
+
+	-- Clock-like runes
+	local runeEmitter = Instance.new("ParticleEmitter")
+	runeEmitter.Texture = "rbxassetid://8177248319"
+	runeEmitter.Lifetime = NumberRange.new(1.2, 1.8)
+	runeEmitter.Rate = 8
+	runeEmitter.Speed = NumberRange.new(0.5, 1)
+	runeEmitter.Rotation = NumberRange.new(0, 360)
+	runeEmitter.RotSpeed = NumberRange.new(-10, 10)
+	runeEmitter.Size = NumberSequence.new({
+		NumberSequenceKeypoint.new(0, 0.5),
+		NumberSequenceKeypoint.new(0.2, 1),
+		NumberSequenceKeypoint.new(0.8, 1),
+		NumberSequenceKeypoint.new(1, 0.5)
+	})
+	runeEmitter.Transparency = NumberSequence.new({
+		NumberSequenceKeypoint.new(0, 0.4),
+		NumberSequenceKeypoint.new(0.5, 0.3),
+		NumberSequenceKeypoint.new(1, 1)
+	})
+	runeEmitter.Color = ColorSequence.new(Color3.fromRGB(220, 180, 255))
+	runeEmitter.LightEmission = 0.6
+	runeEmitter.Parent = centralAttach
+	table.insert(effects, runeEmitter)
+
+	-- Outer arcane barrier
+	local barrierEmitter = Instance.new("ParticleEmitter")
+	barrierEmitter.Texture = "rbxassetid://244221613"
+	barrierEmitter.Lifetime = NumberRange.new(1.5, 2)
+	barrierEmitter.Rate = 10
+	barrierEmitter.Speed = NumberRange.new(0)
+	barrierEmitter.Size = NumberSequence.new({
+		NumberSequenceKeypoint.new(0, 6),
+		NumberSequenceKeypoint.new(0.5, 7),
+		NumberSequenceKeypoint.new(1, 6)
+	})
+	barrierEmitter.Transparency = NumberSequence.new({
+		NumberSequenceKeypoint.new(0, 0.4),
+		NumberSequenceKeypoint.new(0.5, 0.5),
+		NumberSequenceKeypoint.new(1, 0.8)
+	})
+	barrierEmitter.Color = ColorSequence.new({
+		ColorSequenceKeypoint.new(0, Color3.fromRGB(160, 120, 255)),
+		ColorSequenceKeypoint.new(1, Color3.fromRGB(120, 100, 255))
+	})
+	barrierEmitter.LightEmission = 0.7
+	barrierEmitter.Parent = centralAttach
+	table.insert(effects, barrierEmitter)
+
+	-- Orbiting fragments
+	local orbitParts = {}
+	for i = 1, 5 do
+		local orbitPart = Instance.new("Part")
+		orbitPart.Size = Vector3.new(0.2, 0.2, 0.2)
+		orbitPart.Transparency = 1
+		orbitPart.CanCollide = false
+		orbitPart.Anchored = true
+		orbitPart.Parent = workspace
+		table.insert(orbitParts, orbitPart)
+
+		local orbitAttach = Instance.new("Attachment") orbitAttach.Parent = orbitPart
+		local fragEmitter = Instance.new("ParticleEmitter")
+		fragEmitter.Texture = "rbxassetid://6333823"
+		fragEmitter.Lifetime = NumberRange.new(0.3, 0.6)
+		fragEmitter.Rate = 15
+		fragEmitter.Speed = NumberRange.new(0.5, 1)
+		fragEmitter.Size = NumberSequence.new({NumberSequenceKeypoint.new(0, 0.3), NumberSequenceKeypoint.new(1, 0.1)})
+		fragEmitter.Transparency = NumberSequence.new({NumberSequenceKeypoint.new(0, 0.2), NumberSequenceKeypoint.new(1, 1)})
+		fragEmitter.Color = ColorSequence.new(Color3.fromRGB(200, 150, 255))
+		fragEmitter.LightEmission = 0.8
+		fragEmitter.Parent = orbitAttach
+		table.insert(effects, fragEmitter)
+
+		local trail = Instance.new("Trail")
+		trail.Color = ColorSequence.new({ColorSequenceKeypoint.new(0, Color3.fromRGB(180, 120, 255)), ColorSequenceKeypoint.new(1, Color3.fromRGB(120, 100, 255))})
+		trail.Transparency = NumberSequence.new({NumberSequenceKeypoint.new(0, 0.3), NumberSequenceKeypoint.new(1, 1)})
+		trail.Lifetime = 0.3
+		trail.MinLength = 0.02
+		trail.MaxLength = 0.1
+		trail.FaceCamera = true
+		local t1, t2 = Instance.new("Attachment"), Instance.new("Attachment")
+		t1.Position, t2.Position = Vector3.new(-0.1,0,0), Vector3.new(0.1,0,0)
+		t1.Parent, t2.Parent = orbitPart, orbitPart
+		trail.Attachment0, trail.Attachment1 = t1, t2
+		trail.Parent = orbitPart
+	end
+
+	-- Central light
+	local pointLight = Instance.new("PointLight")
+	pointLight.Color, pointLight.Range, pointLight.Brightness = Color3.fromRGB(160,120,255), 8, 1.5
+	pointLight.Parent = torso
+	table.insert(effects, pointLight)
+
+	-- Ambient sound
+	local soundEffect = Instance.new("Sound")
+	soundEffect.SoundId, soundEffect.Volume, soundEffect.Looped = "rbxassetid://169445602", 0.7, true
+	soundEffect.Parent = torso
+	soundEffect:Play()
+	table.insert(effects, soundEffect)
+
+	-- Orbit animation
+	coroutine.wrap(function()
+		local angle = 0
+		while centralAttach and centralAttach.Parent do
+			local dt = wait()
+			angle = angle + dt * 2
+			for i, part in ipairs(orbitParts) do
+				local a = angle + (i * 2 * math.pi / #orbitParts)
+				local r = 3 + 0.5 * math.sin(angle * 0.5 + i)
+				local h = math.sin(angle + i * 0.7)
+
+				-- compute world-space position (Vector3)
+				local worldPos = torso.CFrame:PointToWorldSpace(
+					Vector3.new(math.cos(a) * r, h, math.sin(a) * r)
+				)
+
+				-- set the part's CFrame to that position
+				part.CFrame = CFrame.new(worldPos)
+				-- if you want them oriented toward the torso, use:
+				-- part.CFrame = CFrame.new(worldPos, torso.Position)
+			end
+		end
+	end)()
+
+	-- Pulse effect
+	spawn(function()
+		while centralAttach and centralAttach.Parent do
+			local pe = Instance.new("ParticleEmitter")
+			pe.Texture, pe.Lifetime, pe.Speed = "rbxassetid://241555574", NumberRange.new(0.8,1), NumberRange.new(4,6)
+			pe.Size = NumberSequence.new({NumberSequenceKeypoint.new(0,1),NumberSequenceKeypoint.new(1,8)})
+			pe.Transparency = NumberSequence.new({NumberSequenceKeypoint.new(0,0.2),NumberSequenceKeypoint.new(0.8,0.6),NumberSequenceKeypoint.new(1,1)})
+			pe.LightEmission = 0.8
+			pe.Parent = centralAttach; pe:Emit(1)
+			local fe = Instance.new("ParticleEmitter") fe.Texture,fe.Lifetime,fe.Speed = "rbxassetid://1536547385", NumberRange.new(0.3,0.5), NumberRange.new(0.5,1)
+			fe.Size = NumberSequence.new({NumberSequenceKeypoint.new(0,3),NumberSequenceKeypoint.new(1,1)})
+			fe.Transparency = NumberSequence.new({NumberSequenceKeypoint.new(0,0.2),NumberSequenceKeypoint.new(1,1)})
+			fe.LightEmission = 0.9 fe.Parent=centralAttach fe:Emit(5)
+			wait(0.2); if pe and pe.Parent then pe:Destroy() end; if fe and fe.Parent then fe:Destroy() end; wait(1.8)
+		end
+	end)
+
+	local dist = Instance.new("Part")
+	dist.Size = Vector3.new(8,8,8)
+	dist.Transparency = 0.7
+	dist.Material = Enum.Material.ForceField
+	dist.Color = Color3.fromRGB(200,150,255)
+	dist.Anchored = true
+	dist.CanCollide = false   -- <<< prevent it from pushing players
+	dist.CFrame = torso.CFrame
+	dist.Parent = workspace
+	coroutine.wrap(function() while dist and dist.Parent and torso.Parent do dist.CFrame=torso.CFrame wait(0.05) end end)()
+
+	-- Cleanup function
+	delay(6, function()
+		-- destroy the central attachment & its emitters
+		if centralAttach and centralAttach.Parent then centralAttach:Destroy() end
+
+		-- destroy all the particle/sound effects
+		for _, e in ipairs(effects) do
+			if e and e.Parent then
+				if e:IsA("Sound") then e:Stop() end
+				e:Destroy()
+			end
+		end
+
+		-- destroy your orbiting parts
+		for _, p in ipairs(orbitParts) do
+			if p and p.Parent then
+				p:Destroy()
+			end
+		end
+
+		-- *** NEW: destroy the dist part ***
+		if dist and dist.Parent then
+			dist:Destroy()
+		end
+	end)
+
+	return centralAttach
+end
+
+-- Create Alter Time Completion effect
+local function createAlterTimeCompleteEffect(char, originalPos)
+	local torso = char:FindFirstChild("UpperTorso") or char:FindFirstChild("Torso")
+	if not torso then return end
+
+	-- Flash at original
+	local flashPart = Instance.new("Part") flashPart.Size, flashPart.Transparency = Vector3.new(1,1,1),1
+	flashPart.CanCollide, flashPart.Anchored = false,true
+	flashPart.CFrame, flashPart.Parent = CFrame.new(originalPos), workspace
+	local attach = Instance.new("Attachment", flashPart)
+	local em = Instance.new("ParticleEmitter", attach)
+	em.Texture, em.Lifetime, em.Speed = "rbxassetid://4562787733", NumberRange.new(0.3,0.5), NumberRange.new(8,12)
+	em.Size = NumberSequence.new({NumberSequenceKeypoint.new(0,5),NumberSequenceKeypoint.new(1,0.5)})
+	em.Transparency = NumberSequence.new({NumberSequenceKeypoint.new(0,0),NumberSequenceKeypoint.new(0.8,0.5),NumberSequenceKeypoint.new(1,1)})
+	em.Color, em.LightEmission = ColorSequence.new(Color3.fromRGB(220,180,255)),1; em:Emit(20)
+
+	-- Implosion
+	local impl = Instance.new("ParticleEmitter", attach)
+	impl.Texture, impl.Lifetime, impl.Speed = "rbxassetid://139482291209828", NumberRange.new(0.5,0.7), NumberRange.new(10,15)
+	impl.Size = NumberSequence.new({NumberSequenceKeypoint.new(0,0.2),NumberSequenceKeypoint.new(1,3)})
+	impl.Transparency = NumberSequence.new({NumberSequenceKeypoint.new(0,0.1),NumberSequenceKeypoint.new(0.8,0.5),NumberSequenceKeypoint.new(1,1)})
+	impl.Color, impl.LightEmission = ColorSequence.new(Color3.fromRGB(180,120,255)),0.8; impl:Emit(30)
+
+	-- Ripple
+	local ripple = Instance.new("ParticleEmitter", attach)
+	ripple.Texture, ripple.Lifetime, ripple.Speed = "rbxassetid://16587390596", NumberRange.new(0.8,1), NumberRange.new(0,0)
+	ripple.Size = NumberSequence.new({NumberSequenceKeypoint.new(0,2),NumberSequenceKeypoint.new(1,12)})
+	ripple.Transparency = NumberSequence.new({NumberSequenceKeypoint.new(0,0),NumberSequenceKeypoint.new(0.7,0.5),NumberSequenceKeypoint.new(1,1)})
+	ripple.Color, ripple.LightEmission = ColorSequence.new(Color3.fromRGB(200,150,255)),0.7; ripple:Emit(3)
+
+	-- Light
+	local pl = Instance.new("PointLight", flashPart)
+	pl.Color,pl.Range,pl.Brightness=Color3.fromRGB(180,120,255),15,2
+
+	-- Sound
+	local s = Instance.new("Sound", flashPart)
+	s.SoundId, s.Volume, s.PlaybackSpeed = "rbxassetid://9116278356",1,1.2; s:Play()
+
+	-- Arrival effect
+	local arriv = Instance.new("Attachment", torso)
+	local ae = Instance.new("ParticleEmitter", arriv)
+	ae.Texture,ae.Lifetime,ae.Speed = "rbxassetid://12431492159", NumberRange.new(0.5,0.8), NumberRange.new(4,6)
+	ae.Size = NumberSequence.new({NumberSequenceKeypoint.new(0,2),NumberSequenceKeypoint.new(1,0.2)})
+	ae.Transparency = NumberSequence.new({NumberSequenceKeypoint.new(0,0),NumberSequenceKeypoint.new(0.8,0.5),NumberSequenceKeypoint.new(1,1)})
+	ae.Color,ae.LightEmission=ColorSequence.new(Color3.fromRGB(180,120,255)),0.8; ae:Emit(30)
+
+	delay(2, function() flashPart:Destroy(); arriv:Destroy() end)
+end
+
+-- Example other spell: Blazing Speed
+local function createBlazingTrail(char)
+	local torso = char:FindFirstChild("UpperTorso") or char:FindFirstChild("Torso")
+	if not torso then return end
+	local trail = Instance.new("Trail")
+	trail.Color = ColorSequence.new({ColorSequenceKeypoint.new(0, Color3.fromRGB(255,120,0)), ColorSequenceKeypoint.new(1, Color3.fromRGB(255,255,0))})
+	trail.Lifetime = 0.3
+	trail.MinLength = 0.1
+	trail.MaxLength = 0.5
+	local a1 = Instance.new("Attachment", torso)
+	local a2 = Instance.new("Attachment", torso)
+	a1.Position = Vector3.new(0,0.5,0)
+	a2.Position = Vector3.new(0,-0.5,0)
+	trail.Attachment0, trail.Attachment1 = a1, a2
+	trail.Parent = torso
+	delay(6, function() trail.Enabled=false; wait(1); a1:Destroy(); a2:Destroy(); trail:Destroy() end)
+end
+
+-- Main Event Handler
+castSpellEvent.OnServerEvent:Connect(function(player, spellName, payload)
+	local char     = player.Character
+	if not char then return end
+	local humanoid = char:FindFirstChild("Humanoid")
+	if not humanoid then return end
+
+	if spellName == "IceBarrier" then
+		-- calculate shield amount & bind effect
+		local pct    = tonumber(payload) or 25
+		local amount = humanoid.MaxHealth * (pct/100)
+		bindIceBarrier(player, humanoid, amount)
+
+		-- show buff UI on client
+		buffUIEvent:FireClient(
+			player,
+			"IceBarrier",
+			"Start",
+			60,
+			"Ice Barrier",
+			"Surrounds you with crystals that absorb damage for 60s."
+		)
+
+	elseif spellName == "IceBarrierExpired" then
+		-- cleanup server-side
+		cleanupBarrier(player)
+		-- hide buff UI
+		buffUIEvent:FireClient(player, "IceBarrier", "End")
+
+	elseif spellName == "BlazingSpeed" then
+		-- parse payload, apply speed buff & effects
+		local multiplier = tonumber(payload) or 1.5
+		local duration   = 6
+		OriginalWalkSpeeds[player] = humanoid.WalkSpeed
+		humanoid.WalkSpeed         = humanoid.WalkSpeed * multiplier
+
+		-- VFX + trail
+		attachParticleVFX(char, {
+			Texture      = "rbxassetid://6686254194",
+			Rate         = 100,
+			Lifetime     = NumberRange.new(0.2, 0.5),
+			Speed        = NumberRange.new(2, 3),
+			Size         = NumberSequence.new(1),
+			Color        = ColorSequence.new({
+				ColorSequenceKeypoint.new(0, Color3.fromRGB(255, 255,   0)),
+				ColorSequenceKeypoint.new(1, Color3.fromRGB(255, 100,   0)),
+			}),
+			LightEmission = 0.8,
+		}, duration)
+		createBlazingTrail(char)
+		bindBlazingSpeed(player, duration)
+
+		-- show buff UI on client
+		buffUIEvent:FireClient(
+			player,
+			"BlazingSpeed",
+			"Start",
+			duration,
+			"Blazing Speed",
+			"Increases your speed by " .. math.floor((multiplier - 1) * 100) .. "% for " .. duration .. "s."
+		)
+
+	elseif spellName == "BlazingSpeedExpired" then
+		-- restore speed server-side
+		if OriginalWalkSpeeds[player] then
+			humanoid.WalkSpeed = OriginalWalkSpeeds[player]
+			OriginalWalkSpeeds[player] = nil
+		end
+		hideBuffFrame(player, "BlazingSpeed")
+		-- hide buff UI
+		buffUIEvent:FireClient(player, "BlazingSpeed", "End")
+
+	elseif spellName == "AlterTimeStart" then
+		-- save state, play VFX, bind buff
+		if char.PrimaryPart then
+			AlterTimePositions[player] = char.PrimaryPart.Position
+			AlterTimeHealths[player]   = humanoid.Health
+		end
+		attachParticleVFX(char, {
+			Texture      = "rbxassetid://6761866149",
+			Rate         = 60,
+			Lifetime     = NumberRange.new(0.8, 1.2),
+			Speed        = NumberRange.new(0.5, 1),
+			Size         = NumberSequence.new({
+				NumberSequenceKeypoint.new(0, 2),
+				NumberSequenceKeypoint.new(1, 0),
+			}),
+			Color        = ColorSequence.new(Color3.fromRGB(200,150,255)),
+			RotSpeed     = NumberRange.new(-180, 180),
+		}, 6)
+		createTimeVortex(char)
+		bindAlterTime(player, 6)
+
+		-- show buff UI on client
+		buffUIEvent:FireClient(
+			player,
+			"AlterTime",
+			"Start",
+			6,
+			"Alter Time",
+			"Rewind you back to your position and health when cast ends."
+		)
+
+	elseif spellName == "AlterTimeComplete" then
+		-- server-side restore
+		hideBuffFrame(player, "AlterTime")
+		local origPos    = AlterTimePositions[player]
+		local origHealth = AlterTimeHealths[player]
+		if origPos then
+			createAlterTimeCompleteEffect(char, origPos)
+			char:SetPrimaryPartCFrame(CFrame.new(origPos))
+		end
+		if origHealth then humanoid.Health = origHealth end
+		AlterTimePositions[player] = nil
+		AlterTimeHealths[player]   = nil
+
+		-- hide buff UI
+		buffUIEvent:FireClient(player, "AlterTime", "End")
+
+	elseif spellName == "AlterTimeFailed" then
+		-- just clear without applying
+		hideBuffFrame(player, "AlterTime")
+		AlterTimePositions[player] = nil
+		AlterTimeHealths[player]   = nil
+
+		-- hide buff UI
+		buffUIEvent:FireClient(player, "AlterTime", "End")
+	end
+end)
