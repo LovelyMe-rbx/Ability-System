@@ -1,0 +1,397 @@
+local rs = game:GetService("ReplicatedStorage")
+local ts = game:GetService("TweenService")
+local buffEvent = rs:WaitForChild("BuffUIEvent")
+local ui = script.Parent -- the ScreenGui
+local container = ui:WaitForChild("MainContainer"):WaitForChild("BuffsContainer")
+local tooltip = ui:WaitForChild("DescriptionTooltip")
+
+-- Visual constants
+local FADE_DURATION = 0.3
+local PULSE_DURATION = 0.8
+local LOW_TIME_THRESHOLD = 3 -- Seconds before expiry to show warning effects
+local SHAKE_INTENSITY = 2
+
+-- Animation configs
+local fadeInConfig = TweenInfo.new(FADE_DURATION, Enum.EasingStyle.Back, Enum.EasingDirection.Out)
+local fadeOutConfig = TweenInfo.new(FADE_DURATION, Enum.EasingStyle.Quad, Enum.EasingDirection.In)
+local pulseConfig = TweenInfo.new(PULSE_DURATION/2, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut, -1, true)
+
+-- Sound effects
+local soundEffects = {
+	activate = Instance.new("Sound"),
+	expire = Instance.new("Sound"),
+	warning = Instance.new("Sound")
+}
+
+-- Initialize sounds
+for name, sound in pairs(soundEffects) do
+	sound.Parent = ui
+	if name == "activate" then
+		sound.SoundId = "rbxassetid://129593052698317" -- Replace with actual sound IDs
+		sound.Volume = 0.5
+	elseif name == "expire" then
+		sound.SoundId = "rbxassetid://9085958411"
+		sound.Volume = 0.6
+	elseif name == "warning" then
+		sound.SoundId = "rbxassetid://124951621656853"
+		sound.Volume = 0.4
+	end
+end
+
+-- Buff metadata
+local buffData = {
+	IceBarrier = {
+		color = Color3.fromRGB(64, 156, 255),
+		glowColor = Color3.fromRGB(111, 184, 255),
+		slot = 1
+	},
+	BlazingSpeed = {
+		color = Color3.fromRGB(255, 128, 64),
+		glowColor = Color3.fromRGB(255, 169, 121),
+		slot = 2
+	},
+	AlterTime = {
+		color = Color3.fromRGB(149, 64, 255),
+		glowColor = Color3.fromRGB(192, 132, 255),
+		slot = 3
+	}
+}
+
+-- Cache the three buff-frames
+local frames = {
+	IceBarrier = container:WaitForChild("IceBarrierBuff"),
+	BlazingSpeed = container:WaitForChild("BlazingSpeedBuff"),
+	AlterTime = container:WaitForChild("AlterTimeBuff")
+}
+
+-- Track active buffs
+local activeBuffs = {}
+
+-- Format time display (shows decimal points for times under 10 seconds)
+local function formatTime(seconds)
+	if seconds >= 10 then
+		return math.floor(seconds)
+	else
+		return string.format("%.1f", seconds)
+	end
+end
+
+-- Create a small visual shake effect
+local function applyShakeEffect(frame, duration)
+	local originalPosition = frame.Position
+	local startTime = tick()
+
+	spawn(function()
+		while tick() - startTime < duration do
+			local offsetX = (math.random() - 0.5) * SHAKE_INTENSITY
+			local offsetY = (math.random() - 0.5) * SHAKE_INTENSITY
+			frame.Position = originalPosition + UDim2.new(0, offsetX, 0, offsetY)
+			wait(0.05)
+		end
+		frame.Position = originalPosition
+	end)
+end
+
+-- Apply pulsing glow effect
+local function applyPulseEffect(glowEffect)
+	local originalSize = glowEffect.Size
+	local pulseSize = UDim2.new(originalSize.X.Scale * 1.3, 0, originalSize.Y.Scale * 1.3, 0)
+
+	local pulseTween = ts:Create(glowEffect, pulseConfig, {
+		Size = pulseSize,
+		ImageTransparency = 0.4
+	})
+	pulseTween:Play()
+
+	return pulseTween
+end
+
+-- Apply fading animation
+local function animateAppearance(frame, appearing)
+	local config = appearing and fadeInConfig or fadeOutConfig
+	local targetProps = {
+		Position = appearing 
+			and UDim2.new(0, 0, 0, 0) 
+			or UDim2.new(-0.2, 0, 0, 0),
+		Transparency = appearing and 0 or 1
+	}
+
+	-- Apply to frame components
+	local tweens = {}
+	local components = frame:GetDescendants()
+	table.insert(components, frame)
+
+	for _, obj in pairs(components) do
+		if obj:IsA("GuiObject") then
+			local props = {}
+			props.BackgroundTransparency = appearing and (obj.BackgroundTransparency > 0.9 and obj.BackgroundTransparency or 0) or 1
+
+			if obj:IsA("TextLabel") then
+				props.TextTransparency = appearing and 0 or 1
+			elseif obj:IsA("ImageLabel") then
+				props.ImageTransparency = appearing and (obj.Name == "GlowEffect" and 0.7 or 0) or 1
+			end
+
+			local tween = ts:Create(obj, config, props)
+			tween:Play()
+			table.insert(tweens, tween)
+		end
+	end
+
+	if appearing then
+		frame.Visible = true
+		-- Move from slightly offscreen
+		frame.Position = UDim2.new(-0.2, 0, 0, 0)
+		local positionTween = ts:Create(frame, config, {Position = UDim2.new(0, 0, 0, 0)})
+		positionTween:Play()
+		table.insert(tweens, positionTween)
+	else
+		-- Move offscreen while fading
+		local positionTween = ts:Create(frame, config, {Position = UDim2.new(-0.2, 0, 0, 0)})
+		positionTween:Play()
+		positionTween.Completed:Connect(function()
+			frame.Visible = false
+		end)
+		table.insert(tweens, positionTween)
+	end
+
+	return tweens
+end
+
+-- Enhanced version of showBuff
+local function showBuff(key, duration, name, desc)
+	local frame = frames[key]
+	if not frame then return end
+
+	-- Cancel any existing buff timer
+	if activeBuffs[key] then
+		if activeBuffs[key].cancelFunc then
+			activeBuffs[key].cancelFunc()
+		end
+	end
+
+	-- Apply buff-specific styling
+	local metadata = buffData[key]
+	local img = frame:FindFirstChildWhichIsA("ImageLabel")
+	local icon = img:FindFirstChild("Icon")
+	local glowEffect = img:FindFirstChild("GlowEffect")
+	local progressCircle = img:FindFirstChild("ProgressCircle")
+	local timer = img:FindFirstChild("TimerLabel")
+	local uiStroke = frame:FindFirstChild("UIStroke")
+
+	if metadata then
+		if uiStroke then uiStroke.Color = metadata.color end
+		if glowEffect then glowEffect.ImageColor3 = metadata.glowColor end
+		if progressCircle then progressCircle.ImageColor3 = metadata.color end
+	end
+
+	-- Store additional data for UI access
+	frame:SetAttribute("Description", desc)
+	frame:SetAttribute("BuffName", name or key)
+
+	-- Start animation
+	animateAppearance(frame, true)
+	soundEffects.activate:Play()
+
+	local start = tick()
+	local pulseTween = nil
+	local isCancelled = false
+
+	-- Create cancel function
+	local cancelFunc = function()
+		isCancelled = true
+		if pulseTween then
+			pulseTween:Cancel()
+		end
+	end
+
+	-- Store active buff info
+	activeBuffs[key] = {
+		startTime = start,
+		duration = duration,
+		cancelFunc = cancelFunc
+	}
+
+	-- Start countdown loop
+	spawn(function()
+		while tick() < start + duration and not isCancelled do
+			local elapsed = tick() - start
+			local remaining = duration - elapsed
+			local progress = elapsed / duration
+
+			if timer then
+				timer.Text = formatTime(remaining)
+			end
+
+			if progressCircle then
+				-- Update progress circle (0-1 represents full circle)
+				progressCircle.ImageRectOffset = Vector2.new(0, 0)
+				progressCircle.ImageRectSize = Vector2.new(
+					progressCircle.Image:match("%d+$"), 
+					math.floor(progress * tonumber(progressCircle.Image:match("%d+$")))
+				)
+			end
+
+			-- Warning effects when buff is about to expire
+			if remaining <= LOW_TIME_THRESHOLD and not pulseTween and glowEffect then
+				pulseTween = applyPulseEffect(glowEffect)
+				soundEffects.warning:Play()
+				applyShakeEffect(frame, 0.3)
+			end
+
+			wait(0.03) -- More frequent updates for smoother animation
+		end
+
+		if not isCancelled then
+			-- Play expire sound and hide buff
+			soundEffects.expire:Play()
+			animateAppearance(frame, false)
+
+			-- Remove from active buffs
+			activeBuffs[key] = nil
+		end
+	end)
+end
+
+local function hideBuff(key)
+	local frame = frames[key]
+	if not frame then return end
+
+	-- Cancel any ongoing effects
+	if activeBuffs[key] and activeBuffs[key].cancelFunc then
+		activeBuffs[key].cancelFunc()
+	end
+
+	-- Start fade out animation
+	animateAppearance(frame, false)
+
+	-- Remove from active buffs
+	activeBuffs[key] = nil
+end
+
+-- Organize buffs by slot position
+local function organizeBuffPositions()
+	local visibleBuffs = {}
+
+	for key, data in pairs(activeBuffs) do
+		if frames[key] and frames[key].Visible then
+			table.insert(visibleBuffs, {
+				key = key,
+				frame = frames[key],
+				slot = buffData[key].slot or #visibleBuffs + 1
+			})
+		end
+	end
+
+	-- Sort by slot number
+	table.sort(visibleBuffs, function(a, b)
+		return a.slot < b.slot
+	end)
+
+	-- Reposition all visible buffs
+	for i, buffInfo in ipairs(visibleBuffs) do
+		local targetPosition = UDim2.new(0, 0, 0, (i-1) * (buffInfo.frame.Size.Y.Offset + 5))
+		local positionTween = ts:Create(buffInfo.frame, TweenInfo.new(0.3), {
+			Position = targetPosition
+		})
+		positionTween:Play()
+	end
+end
+
+-- Enhanced tooltip handlers
+for key, frame in pairs(frames) do
+	local tooltipOffset = UDim2.new(1.1, 0, 0, 0)
+
+	frame.MouseEnter:Connect(function()
+		tooltip.Visible = true
+
+		-- Position tooltip next to the buff
+		tooltip.Position = UDim2.new(
+			0, frame.AbsolutePosition.X + frame.AbsoluteSize.X + 10,
+			0, frame.AbsolutePosition.Y
+		)
+
+		-- Update tooltip content
+		tooltip.NameLabel.Text = frame:GetAttribute("BuffName") or frame.Name
+		tooltip.DescriptionLabel.Text = frame:GetAttribute("Description") or ""
+
+		-- Animate tooltip appearance
+		tooltip.BackgroundTransparency = 1
+		for _, child in pairs(tooltip:GetChildren()) do
+			if child:IsA("GuiObject") then
+				if child:IsA("TextLabel") then
+					child.TextTransparency = 1
+				elseif child:IsA("ImageLabel") then
+					child.ImageTransparency = 1
+				end
+				child.BackgroundTransparency = 1
+			end
+		end
+
+		-- Fade in tooltip
+		local tooltipTween = ts:Create(tooltip, TweenInfo.new(0.2), {BackgroundTransparency = 0.2})
+		tooltipTween:Play()
+
+		for _, child in pairs(tooltip:GetChildren()) do
+			if child:IsA("GuiObject") then
+				local props = {BackgroundTransparency = child.BackgroundTransparency > 0.9 and child.BackgroundTransparency or 0}
+
+				if child:IsA("TextLabel") then
+					props.TextTransparency = 0
+				elseif child:IsA("ImageLabel") then
+					props.ImageTransparency = 0
+				end
+
+				local childTween = ts:Create(child, TweenInfo.new(0.2), props)
+				childTween:Play()
+			end
+		end
+	end)
+
+	frame.MouseLeave:Connect(function()
+		-- Fade out tooltip
+		local tooltipTween = ts:Create(tooltip, TweenInfo.new(0.2), {BackgroundTransparency = 1})
+		tooltipTween:Play()
+
+		for _, child in pairs(tooltip:GetChildren()) do
+			if child:IsA("GuiObject") then
+				local props = {BackgroundTransparency = 1}
+
+				if child:IsA("TextLabel") then
+					props.TextTransparency = 1
+				elseif child:IsA("ImageLabel") then
+					props.ImageTransparency = 1
+				end
+
+				local childTween = ts:Create(child, TweenInfo.new(0.2), props)
+				childTween:Play()
+			end
+		end
+
+		wait(0.2)
+		tooltip.Visible = false
+	end)
+end
+
+-- Listen for server events
+buffEvent.OnClientEvent:Connect(function(key, action, duration, name, desc)
+	if action == "Start" then
+		showBuff(key, duration, name, desc)
+	elseif action == "Stop" then
+		hideBuff(key)
+	elseif action == "Refresh" then
+		-- Refresh an existing buff (extend time, animate refresh, etc.)
+		hideBuff(key)
+		wait(0.1) -- Small delay for visual feedback
+		showBuff(key, duration, name, desc)
+	end
+
+	-- Reorganize buff positions after any change
+	wait(0.05) -- Wait for visibility changes
+	organizeBuffPositions()
+end)
+
+-- Initialize all frames to hidden
+for _, frame in pairs(frames) do
+	frame.Visible = false
+end
