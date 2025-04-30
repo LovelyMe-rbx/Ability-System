@@ -1,0 +1,403 @@
+-- SpellAbilityScript (LocalScript)
+-- Modified to remove all mana costs from abilities
+
+-- Services
+local Players            = game:GetService("Players")
+local UserInputService   = game:GetService("UserInputService")
+local TweenService       = game:GetService("TweenService")
+local ReplicatedStorage  = game:GetService("ReplicatedStorage")
+local RunService         = game:GetService("RunService")
+
+-- Player and Mana Variables
+local player            = Players.LocalPlayer
+local baseMana          = 100
+local currentMana       = 100
+local manaRegenInterval = 1
+local gcdTime           = 1.5
+local isCasting         = false
+local globalCooldown    = false
+
+-- Cooldown Times
+local iceBarrierCooldown   = 25
+local alterTimeCooldown    = 90
+local blazingSpeedCooldown = 25
+
+-- Ability Duration Times
+local iceBarrierDuration   = 60
+local alterTimeDuration    = 6
+local blazingSpeedDuration = 6
+
+-- Arcane Charge Variables
+local maxArcaneCharges     = 4
+local currentArcaneCharges = 0
+
+-- UI References
+local playerGui = player:WaitForChild("PlayerGui")
+
+-- Mana UI
+local manaGui   = playerGui:WaitForChild("ManaGui")
+local manaBar   = manaGui:WaitForChild("ManaBar")
+local manaFill  = manaBar:WaitForChild("Fill")
+local manaText  = manaGui:WaitForChild("ManaText")
+
+-- Ability Buttons
+local arcaneMageGui          = playerGui:WaitForChild("ArcaneMage")
+local leftMultiActionBarFrame = arcaneMageGui:WaitForChild("LeftMultiActionBarFrame")
+local multiActionSlot4       = leftMultiActionBarFrame:WaitForChild("MultiActionSlot4")
+local multiActionSlot5       = leftMultiActionBarFrame:WaitForChild("MultiActionSlot5")
+local multiActionSlot6       = leftMultiActionBarFrame:WaitForChild("MultiActionSlot6")
+
+local cooldownOverlay1 = multiActionSlot4:FindFirstChild("CooldownOverlay")
+local cooldownOverlay2 = multiActionSlot5:FindFirstChild("CooldownOverlay")
+local cooldownOverlay3 = multiActionSlot6:FindFirstChild("CooldownOverlay")
+
+-- Casting Bar
+local abilityBars = playerGui:WaitForChild("AbilityBars")
+local castingBar  = abilityBars:WaitForChild("CastingBar")
+local castFill    = castingBar:WaitForChild("Bar")
+local castTimer   = castingBar:WaitForChild("Timer")
+
+-- Arcane Charge UI
+local arcaneChargeGui    = playerGui:WaitForChild("ArcaneChargeGui")
+local chargeImage        = arcaneChargeGui:WaitForChild("ImageLabel")
+local chargeText         = arcaneChargeGui:WaitForChild("ChargeText")
+local originalChargeSize = chargeImage.Size
+local chargeOverlay      = chargeImage:WaitForChild("CooldownOverlay")
+
+-- Notifier System
+local notifierGui  = playerGui:WaitForChild("NotifierSystem")
+local warningLabel = notifierGui:WaitForChild("WarningLabel")
+warningLabel.Visible = false
+
+-- Remote event for VFX, sound, animation, etc.
+local castSpellEvent = ReplicatedStorage:WaitForChild("CastSpellEvent")
+
+--------------------------------------------------------
+-- Tween Setup
+--------------------------------------------------------
+local originalSize1       = multiActionSlot4.Size
+local originalColor1      = multiActionSlot4.BackgroundColor3
+local originalSize2       = multiActionSlot5.Size
+local originalColor2      = multiActionSlot5.BackgroundColor3
+local originalSize3       = multiActionSlot6.Size
+local originalColor3      = multiActionSlot6.BackgroundColor3
+local pressTweenInfo      = TweenInfo.new(0.1, Enum.EasingStyle.Back)
+local hoverTweenInfo      = TweenInfo.new(0.1, Enum.EasingStyle.Quad)
+local castEffectTweenInfo = TweenInfo.new(0.1, Enum.EasingStyle.Back)
+
+--------------------------------------------------------
+-- Ability State Variables
+--------------------------------------------------------
+local iceBarrierOnCooldown   = false
+local iceBarrierActive       = false
+local alterTimeOnCooldown    = false
+local alterTimeActive        = false
+local blazingSpeedOnCooldown = false
+local blazingSpeedActive     = false
+
+-- Alter Time Saved State
+local alterTimeState = {
+	position       = nil,
+	health         = nil,
+	arcaneCharges  = 0
+}
+
+--------------------------------------------------------
+-- Helper: Display Warning Text
+--------------------------------------------------------
+local function displayWarning(msg)
+	warningLabel.Text = msg
+	warningLabel.Visible = true
+	delay(2, function() warningLabel.Visible = false end)
+end
+
+--------------------------------------------------------
+-- Update UI Functions
+--------------------------------------------------------
+local function updateManaUI()
+	manaText.Text = string.format("Mana: %d / %d", currentMana, baseMana)
+	local fillPct = math.clamp(currentMana / baseMana, 0, 1)
+	manaFill:TweenSize(UDim2.new(fillPct, 0, 1, 0), "Out", "Quad", 0.3, true)
+end
+
+local function pulseArcaneCharge()
+	local pulse = TweenService:Create(chargeImage, TweenInfo.new(0.1, Enum.EasingStyle.Back),
+		{Size = originalChargeSize + UDim2.new(0,10,0,10)})
+	local reset = TweenService:Create(chargeImage, TweenInfo.new(0.1, Enum.EasingStyle.Back),
+		{Size = originalChargeSize})
+	pulse:Play()
+	pulse.Completed:Connect(function() reset:Play() end)
+end
+
+local function updateArcaneChargeUI()
+	chargeText.Text = tostring(currentArcaneCharges)
+	pulseArcaneCharge()
+end
+
+--------------------------------------------------------
+-- Cooldown Functions
+--------------------------------------------------------
+local function startCooldown(slot, duration)
+	local overlay
+	if slot == 1 then
+		overlay = cooldownOverlay1
+		iceBarrierOnCooldown = true
+	elseif slot == 2 then
+		overlay = cooldownOverlay2
+		alterTimeOnCooldown = true
+	elseif slot == 3 then
+		overlay = cooldownOverlay3
+		blazingSpeedOnCooldown = true
+	end
+
+	if overlay then
+		overlay.Visible = true
+		overlay.Size = UDim2.new(1, 0, 1, 0)
+		local cdTween = TweenService:Create(overlay, TweenInfo.new(duration),
+			{Size = UDim2.new(1, 0, 0, 0)})
+		cdTween:Play()
+		cdTween.Completed:Connect(function()
+			overlay.Visible = false
+			if slot == 1 then iceBarrierOnCooldown = false
+			elseif slot == 2 then alterTimeOnCooldown = false
+			else blazingSpeedOnCooldown = false end
+		end)
+	else
+		wait(duration)
+		if slot == 1 then iceBarrierOnCooldown = false
+		elseif slot == 2 then alterTimeOnCooldown = false
+		else blazingSpeedOnCooldown = false end
+	end
+end
+
+--------------------------------------------------------
+-- Mana Regeneration Loop
+--------------------------------------------------------
+spawn(function()
+	while true do
+		wait(manaRegenInterval)
+		if currentMana < baseMana then
+			currentMana = currentMana + 1
+			updateManaUI()
+		end
+	end
+end)
+
+--------------------------------------------------------
+-- Ice Barrier (MultiActionSlot4)
+--------------------------------------------------------
+local function castIceBarrier()
+	if iceBarrierOnCooldown then
+		displayWarning("Ice Barrier is on cooldown!")
+		return
+	end
+	if globalCooldown then
+		displayWarning("Global cooldown active!")
+		return
+	end
+
+	-- Visual feedback
+	TweenService:Create(multiActionSlot4, castEffectTweenInfo, {
+		Size = originalSize1 + UDim2.new(0,10,0,10),
+		BackgroundColor3 = Color3.new(0.6,0.8,1)
+	}):Play()
+
+	startCooldown(1, iceBarrierCooldown)
+	castSpellEvent:FireServer("IceBarrier", 27.3)
+	iceBarrierActive = true
+
+	delay(iceBarrierDuration, function()
+		if iceBarrierActive then
+			iceBarrierActive = false
+			castSpellEvent:FireServer("IceBarrierExpired")
+		end
+	end)
+
+	globalCooldown = true
+	delay(gcdTime, function()
+		globalCooldown = false
+		TweenService:Create(multiActionSlot4, pressTweenInfo, {
+			Size = originalSize1,
+			BackgroundColor3 = originalColor1
+		}):Play()
+	end)
+end
+
+--------------------------------------------------------
+-- Alter Time (MultiActionSlot5)
+--------------------------------------------------------
+local function castAlterTime()
+	if alterTimeOnCooldown then
+		displayWarning("Alter Time is on cooldown!")
+		return
+	end
+
+	-- Store current state
+	alterTimeState.position      = player.Character and player.Character.PrimaryPart.CFrame.Position
+	alterTimeState.health        = player.Character and player.Character:FindFirstChild("Humanoid") and
+		player.Character.Humanoid.Health
+	alterTimeState.arcaneCharges = currentArcaneCharges
+
+	-- Visual feedback
+	TweenService:Create(multiActionSlot5, castEffectTweenInfo, {
+		Size = originalSize2 + UDim2.new(0,10,0,10),
+		BackgroundColor3 = Color3.new(0.9,0.7,1)
+	}):Play()
+
+	castSpellEvent:FireServer("AlterTimeStart")
+	alterTimeActive = true
+
+	delay(alterTimeDuration, function()
+		if alterTimeActive then
+			local char = player.Character
+			local hum  = char and char:FindFirstChild("Humanoid")
+			if hum and hum.Health > 0 then
+				local currentPos = char.PrimaryPart.CFrame.Position
+				if (currentPos - alterTimeState.position).Magnitude < 50 then
+					castSpellEvent:FireServer("AlterTimeComplete", {
+						position = alterTimeState.position,
+						health   = alterTimeState.health
+					})
+					currentArcaneCharges = alterTimeState.arcaneCharges
+					updateArcaneChargeUI()
+				else
+					castSpellEvent:FireServer("AlterTimeFailed", "MovedTooFar")
+					displayWarning("Alter Time failed: Moved too far!")
+				end
+			else
+				castSpellEvent:FireServer("AlterTimeFailed", "Died")
+				displayWarning("Alter Time failed: You died!")
+			end
+			alterTimeActive = false
+		end
+	end)
+
+	startCooldown(2, alterTimeCooldown)
+	delay(0.5, function()
+		TweenService:Create(multiActionSlot5, pressTweenInfo, {
+			Size = originalSize2,
+			BackgroundColor3 = originalColor2
+		}):Play()
+	end)
+end
+
+--------------------------------------------------------
+-- Blazing Speed (MultiActionSlot6)
+--------------------------------------------------------
+local function castBlazingSpeed()
+	if blazingSpeedOnCooldown then
+		displayWarning("Blazing Speed is on cooldown!")
+		return
+	end
+
+	TweenService:Create(multiActionSlot6, castEffectTweenInfo, {
+		Size = originalSize3 + UDim2.new(0,10,0,10),
+		BackgroundColor3 = Color3.new(1,0.6,0.2)
+	}):Play()
+
+	castSpellEvent:FireServer("BlazingSpeed", 1.5)
+	blazingSpeedActive = true
+
+	delay(blazingSpeedDuration, function()
+		if blazingSpeedActive then
+			blazingSpeedActive = false
+			castSpellEvent:FireServer("BlazingSpeedExpired")
+		end
+	end)
+
+	startCooldown(3, blazingSpeedCooldown)
+	delay(0.5, function()
+		TweenService:Create(multiActionSlot6, pressTweenInfo, {
+			Size = originalSize3,
+			BackgroundColor3 = originalColor3
+		}):Play()
+	end)
+end
+
+--------------------------------------------------------
+-- Input & Hover Effects
+--------------------------------------------------------
+multiActionSlot4.MouseButton1Click:Connect(castIceBarrier)
+multiActionSlot5.MouseButton1Click:Connect(castAlterTime)
+multiActionSlot6.MouseButton1Click:Connect(castBlazingSpeed)
+
+UserInputService.InputBegan:Connect(function(input, gp)
+	if arcaneMageGui.Enabled == false then return end
+	if gp then return end
+	if input.KeyCode == Enum.KeyCode.Seven then castIceBarrier() end
+	if input.KeyCode == Enum.KeyCode.Eight then castAlterTime() end
+	if input.KeyCode == Enum.KeyCode.Nine then castBlazingSpeed() end
+end)
+
+--------------------------------------------------------
+-- Hover Effects (unchanged)
+--------------------------------------------------------
+-- Ice Barrier Hover
+multiActionSlot4.MouseEnter:Connect(function()
+	if not iceBarrierOnCooldown then
+		TweenService:Create(multiActionSlot4, hoverTweenInfo, {
+			Size = originalSize1 + UDim2.new(0,5,0,5)
+		}):Play()
+		TweenService:Create(multiActionSlot4, hoverTweenInfo, {
+			BackgroundColor3 = Color3.new(0.6,0.8,1)
+		}):Play()
+	end
+end)
+multiActionSlot4.MouseLeave:Connect(function()
+	if not iceBarrierOnCooldown then
+		TweenService:Create(multiActionSlot4, hoverTweenInfo, {
+			Size = originalSize1
+		}):Play()
+		TweenService:Create(multiActionSlot4, hoverTweenInfo, {
+			BackgroundColor3 = originalColor1
+		}):Play()
+	end
+end)
+
+-- Alter Time Hover
+multiActionSlot5.MouseEnter:Connect(function()
+	if not alterTimeOnCooldown then
+		TweenService:Create(multiActionSlot5, hoverTweenInfo, {
+			Size = originalSize2 + UDim2.new(0,5,0,5)
+		}):Play()
+		TweenService:Create(multiActionSlot5, hoverTweenInfo, {
+			BackgroundColor3 = Color3.new(0.9,0.7,1)
+		}):Play()
+	end
+end)
+multiActionSlot5.MouseLeave:Connect(function()
+	if not alterTimeOnCooldown then
+		TweenService:Create(multiActionSlot5, hoverTweenInfo, {
+			Size = originalSize2
+		}):Play()
+		TweenService:Create(multiActionSlot5, hoverTweenInfo, {
+			BackgroundColor3 = originalColor2
+		}):Play()
+	end
+end)
+
+-- Blazing Speed Hover
+multiActionSlot6.MouseEnter:Connect(function()
+	if not blazingSpeedOnCooldown then
+		TweenService:Create(multiActionSlot6, hoverTweenInfo, {
+			Size = originalSize3 + UDim2.new(0,5,0,5)
+		}):Play()
+		TweenService:Create(multiActionSlot6, hoverTweenInfo, {
+			BackgroundColor3 = Color3.new(1,0.6,0.2)
+		}):Play()
+	end
+end)
+multiActionSlot6.MouseLeave:Connect(function()
+	if not blazingSpeedOnCooldown then
+		TweenService:Create(multiActionSlot6, hoverTweenInfo, {
+			Size = originalSize3
+		}):Play()
+		TweenService:Create(multiActionSlot6, hoverTweenInfo, {
+			BackgroundColor3 = originalColor3
+		}):Play()
+	end
+end)
+
+-- Init UI
+updateManaUI()
+updateArcaneChargeUI()
